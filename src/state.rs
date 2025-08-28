@@ -21,11 +21,18 @@ pub struct Config {
 }
 
 #[repr(u8)]
+#[derive(PartialEq, Eq)]
 pub enum AmmState {
     Uninitialized = 0u8,
     Initialized = 1u8,
     Disabled = 2u8,
     WithdrawOnly = 3u8,
+}
+
+impl AmmState {
+    pub fn is_initialized(self) -> bool {
+        matches!(self, AmmState::Initialized)
+    }
 }
 
 impl Config {
