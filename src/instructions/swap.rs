@@ -1,5 +1,5 @@
 use crate::{AmmState, Config};
-use constant_product_curve::ConstantProduct;
+use constant_product_curve::{ConstantProduct, LiquidityPair};
 use pinocchio::account_info::AccountInfo;
 use pinocchio::instruction::{Seed, Signer};
 use pinocchio::program_error::ProgramError;
@@ -7,27 +7,24 @@ use pinocchio::pubkey::find_program_address;
 use pinocchio::sysvars::clock::Clock;
 use pinocchio::sysvars::Sysvar;
 use pinocchio::ProgramResult;
-use pinocchio_token::instructions::{MintTo, Transfer};
-use pinocchio_token::state::{Mint, TokenAccount};
+use pinocchio_token::instructions::Transfer;
+use pinocchio_token::state::TokenAccount;
 
-pub struct DepositAccounts<'a> {
+pub struct SwapAccounts<'a> {
     pub user: &'a AccountInfo,
-    pub mint_lp: &'a AccountInfo,
-    pub vault_x: &'a AccountInfo,
-    pub vault_y: &'a AccountInfo,
     pub user_x_ata: &'a AccountInfo,
     pub user_y_ata: &'a AccountInfo,
-    pub user_lp_ata: &'a AccountInfo,
+    pub vault_x: &'a AccountInfo,
+    pub vault_y: &'a AccountInfo,
     pub config: &'a AccountInfo,
     pub token_program: &'a AccountInfo,
 }
 
-impl<'a> TryFrom<&'a [AccountInfo]> for DepositAccounts<'a> {
+impl<'a> TryFrom<&'a [AccountInfo]> for SwapAccounts<'a> {
     type Error = ProgramError;
 
     fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
-        let [user, mint_lp, vault_x, vault_y, user_x_ata, user_y_ata, user_lp_ata, config, token_program] =
-            accounts
+        let [user, user_x_ata, user_y_ata, vault_x, vault_y, config, token_program] = accounts
         else {
             return Err(ProgramError::NotEnoughAccountKeys);
         };
@@ -41,12 +38,10 @@ impl<'a> TryFrom<&'a [AccountInfo]> for DepositAccounts<'a> {
 
         Ok(Self {
             user,
-            mint_lp,
-            vault_x,
-            vault_y,
             user_x_ata,
             user_y_ata,
-            user_lp_ata,
+            vault_x,
+            vault_y,
             config,
             token_program,
         })
@@ -54,31 +49,30 @@ impl<'a> TryFrom<&'a [AccountInfo]> for DepositAccounts<'a> {
 }
 
 #[repr(C)]
-pub struct DepositInstructionData {
-    /// Amount the user wishes to receive
+pub struct SwapInstructionData {
+    pub is_x: bool,
     pub amount: u64,
-    pub max_x: u64,
-    pub max_y: u64,
+    pub min: u64,
     pub expiration: i64,
 }
 
-impl<'a> TryFrom<&'a [u8]> for DepositInstructionData {
+impl<'a> TryFrom<&'a [u8]> for SwapInstructionData {
     type Error = ProgramError;
 
     fn try_from(data: &'a [u8]) -> Result<Self, Self::Error> {
-        if data.len().ne(&(size_of::<u64>() * 4)) {
+        if data.len().ne(&(size_of::<u64>() * 3 + size_of::<bool>())) {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let is_x = data[0] != 0;
+        let amount = u64::from_le_bytes(data[1..9].try_into().unwrap());
 
         if amount == 0 {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        let max_x = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let max_y = u64::from_le_bytes(data[16..24].try_into().unwrap());
-        let expiration = i64::from_le_bytes(data[24..32].try_into().unwrap());
+        let min = u64::from_le_bytes(data[9..17].try_into().unwrap());
+        let expiration = i64::from_le_bytes(data[17..25].try_into().unwrap());
 
         // Check signature expiration
         let now = Clock::get()?.unix_timestamp;
@@ -87,25 +81,25 @@ impl<'a> TryFrom<&'a [u8]> for DepositInstructionData {
         }
 
         Ok(Self {
+            is_x,
             amount,
-            max_x,
-            max_y,
+            min,
             expiration,
         })
     }
 }
 
-pub struct Deposit<'a> {
-    pub accounts: DepositAccounts<'a>,
-    pub instruction_data: DepositInstructionData,
+pub struct Swap<'a> {
+    pub accounts: SwapAccounts<'a>,
+    pub instruction_data: SwapInstructionData,
 }
 
-impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for Deposit<'a> {
+impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for Swap<'a> {
     type Error = ProgramError;
 
     fn try_from((data, accounts): (&'a [u8], &'a [AccountInfo])) -> Result<Self, Self::Error> {
-        let accounts = DepositAccounts::try_from(accounts)?;
-        let instruction_data = DepositInstructionData::try_from(data)?;
+        let accounts = SwapAccounts::try_from(accounts)?;
+        let instruction_data = SwapInstructionData::try_from(data)?;
 
         // Return the initialized struct
         Ok(Self {
@@ -115,8 +109,8 @@ impl<'a> TryFrom<(&'a [u8], &'a [AccountInfo])> for Deposit<'a> {
     }
 }
 
-impl<'a> Deposit<'a> {
-    pub const DISCRIMINATOR: &'a u8 = &1;
+impl<'a> Swap<'a> {
+    pub const DISCRIMINATOR: &'a u8 = &3;
 
     pub fn process(&mut self) -> ProgramResult {
         let config = Config::load(self.accounts.config)?;
@@ -125,7 +119,7 @@ impl<'a> Deposit<'a> {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Check if the vault_x ATA is valid
+        // Check if the vault_x is valid
         let (vault_x, _) = find_program_address(
             &[
                 self.accounts.config.key(),
@@ -139,7 +133,7 @@ impl<'a> Deposit<'a> {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Check if the vault_y ATA is valid
+        // Check if the vault_y is valid
         let (vault_y, _) = find_program_address(
             &[
                 self.accounts.config.key(),
@@ -154,50 +148,33 @@ impl<'a> Deposit<'a> {
         }
 
         // Deserialize the token accounts
-        let mint_lp = unsafe { Mint::from_account_info_unchecked(self.accounts.mint_lp)? };
         let vault_x = unsafe { TokenAccount::from_account_info_unchecked(self.accounts.vault_x)? };
         let vault_y = unsafe { TokenAccount::from_account_info_unchecked(self.accounts.vault_y)? };
 
-        // Grab the amounts to deposit
-        let (x, y) = match mint_lp.supply() == 0 && vault_x.amount() == 0 && vault_y.amount() == 0 {
-            true => (self.instruction_data.max_x, self.instruction_data.max_y),
-            false => {
-                let amounts = ConstantProduct::xy_deposit_amounts_from_l(
-                    vault_x.amount(),
-                    vault_y.amount(),
-                    mint_lp.supply(),
-                    self.instruction_data.amount,
-                    6,
-                )
-                .map_err(|_| ProgramError::InvalidArgument)?;
+        // Swap Calculations
+        let mut curve = ConstantProduct::init(
+            vault_x.amount(),
+            vault_y.amount(),
+            vault_x.amount(),
+            config.fee(),
+            None,
+        )
+        .map_err(|_| ProgramError::Custom(1))?;
 
-                (amounts.x, amounts.y)
-            }
+        let p = match self.instruction_data.is_x {
+            true => LiquidityPair::X,
+            false => LiquidityPair::Y,
         };
 
-        // Check for slippage
-        if !(x <= self.instruction_data.max_x && y <= self.instruction_data.max_y) {
+        let swap_result = curve
+            .swap(p, self.instruction_data.amount, self.instruction_data.min)
+            .map_err(|_| ProgramError::Custom(1))?;
+
+        // Check for correct values
+        if swap_result.deposit == 0 || swap_result.withdraw == 0 {
             return Err(ProgramError::InvalidArgument);
         }
 
-        // Transfer the amounts from the token accounts of the user to the vaults
-        Transfer {
-            from: self.accounts.user_x_ata,
-            to: self.accounts.vault_x,
-            authority: self.accounts.user,
-            amount: x,
-        }
-        .invoke()?;
-
-        Transfer {
-            from: self.accounts.user_y_ata,
-            to: self.accounts.vault_y,
-            authority: self.accounts.user,
-            amount: y,
-        }
-        .invoke()?;
-
-        // and mint the appropriate amount of LP tokens to the user token account
         let seed_binding = config.seed().to_le_bytes();
         let config_bump_binding = config.config_bump();
         let config_seeds = [
@@ -208,17 +185,41 @@ impl<'a> Deposit<'a> {
             Seed::from(&config_bump_binding),
         ];
 
-        let signer = [Signer::from(&config_seeds)];
+        let signer_seeds = [Signer::from(&config_seeds)];
 
-        MintTo {
-            // minting happens to the User LP ATA
-            account: self.accounts.user_lp_ata,
-            amount: self.instruction_data.amount,
-            mint: self.accounts.mint_lp,
-            // the authority is still the pool
-            mint_authority: self.accounts.config,
+        if self.instruction_data.is_x {
+            Transfer {
+                amount: swap_result.deposit,
+                authority: self.accounts.user,
+                from: self.accounts.user_x_ata,
+                to: self.accounts.vault_x,
+            }
+            .invoke()?;
+
+            Transfer {
+                amount: swap_result.withdraw,
+                authority: self.accounts.config,
+                from: self.accounts.vault_y,
+                to: self.accounts.user_y_ata,
+            }
+            .invoke_signed(&signer_seeds)?;
+        } else {
+            Transfer {
+                amount: swap_result.deposit,
+                authority: self.accounts.user,
+                from: self.accounts.user_y_ata,
+                to: self.accounts.vault_y,
+            }
+            .invoke()?;
+
+            Transfer {
+                amount: swap_result.withdraw,
+                authority: self.accounts.config,
+                from: self.accounts.vault_x,
+                to: self.accounts.user_x_ata,
+            }
+            .invoke_signed(&signer_seeds)?;
         }
-        .invoke_signed(&signer)?;
 
         Ok(())
     }
